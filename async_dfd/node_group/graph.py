@@ -1,4 +1,10 @@
 import logging
+import logging
+from abc import ABC, abstractmethod
+
+import gevent
+from gevent import spawn
+from .node_group import NodeGroup
 from collections import deque, defaultdict
 
 from .node_group import NodeGroup
@@ -12,7 +18,15 @@ class Graph(NodeGroup):
         super().start()
         self.heads = {}
         self.tails = {}
-
+    
+    @abstractmethod
+    def end(self):
+        self.is_start = False
+        end_tasks = []
+        for node in self.all_nodes.values():
+            end_tasks.append(spawn(node.end))
+        gevent.joinall(end_tasks)
+        
     @property
     def src_nodes(self):
         src_nodes = {}
@@ -36,7 +50,7 @@ class Graph(NodeGroup):
         raise NotImplementedError("Graph has multiple tails, use tails instead")
         
 
-    def topological_sort(self, all_nodes):
+    def _topological_sort(self, all_nodes):
         in_degree = defaultdict(int)
         descriptions = {}
         for desc, node in all_nodes:

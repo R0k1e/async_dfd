@@ -1,11 +1,11 @@
 from .graph import Graph
 from .pipeline import Pipeline
-from .sequential import Sequential
 from .special_pipeline import (
     CyclePipeline,
     LabelPipeline,
     IterablePipeline,
     OrderPipeline,
+    Sequential
 )
 
 __all__ = [

@@ -18,7 +18,7 @@ from tenacity import (
 from .decorator import *
 
 from .. import ASYNC_DFD_CONFIG
-from ..exceptions import NodeProcessingError, NodeStop
+from ..exceptions import NodeProcessingError
 from .abstract_node import AbstractNode
 from .node_link import NodeLink
 
@@ -38,7 +38,7 @@ class Node(AbstractNode, NodeLink):
         discard_none_output=False,
         skip_error=True,
         timeout=None,
-        put_deepcopy_data=False
+        put_deepcopy_data=False,
     ) -> None:
         super().__init__()
         self.timeout = timeout if timeout else ASYNC_DFD_CONFIG.get("timeout", None)
@@ -52,12 +52,13 @@ class Node(AbstractNode, NodeLink):
         self.__name__ = proc_func.__name__
         self.head = self
         self.tail = self
-        self.is_start = False
+        self.is_start = False  # None means draining
 
         self.src_queue = Queue(self.queue_size)
-        self.criterias = {}
-        self.src_nodes = {}
-        self.dst_nodes = {}
+        self.criterias = {}  # key: criteria function, value: [dst_nodes]
+        # node could be add multiple times
+        self.src_nodes = []
+        self.dst_nodes = []
         self.get_data_lock = gevent.lock.Semaphore(1)
 
         self.no_input = no_input
@@ -66,7 +67,7 @@ class Node(AbstractNode, NodeLink):
         self.discard_none_output = discard_none_output
         self.skip_error = skip_error
         self.put_deepcopy_data = put_deepcopy_data
-        
+
         # first decorator will first wrap, as the inner decorator
         self.get_decorators = []
         self.proc_decorators = []
@@ -91,30 +92,51 @@ class Node(AbstractNode, NodeLink):
 
     def end(self):
         """
-        Signals the end of the pipeline by putting a stop flag in the source queue.
+        Stop the node while all data has been processed.
         """
-        for _ in range(self.worker_num):
-            self.src_queue.put(NodeStop())
+        self.wait_for_empty()
+        self.is_start = False
+        gevent.joinall(self.tasks)
+        logger.info(f"Node {self.__name__} has been ended")
+        return
+
+    def halt(self):
+        self.is_start = False
+        gevent.joinall(self.tasks, timeout=0.1)
+        logger.info(f"Node {self.__name__} has been halted")
+        return
+
+    def is_empty(self):
+        return self.src_queue.empty() and len(self.executing_data_queue) == 0
 
     def put(self, data):
         self.src_queue.put(data)
 
-    def connect(self, node, criteria=None):
-        self.set_dst_node(node)
-        node.set_src_node(self)
+    def default_criteria(self, data):
+        """Default criteria that always returns True"""
+        return True
 
+    def connect(self, node, criteria=None):
+        if isinstance(node, Node):
+            node.set_src_node(self)
+
+        self.set_dst_node(node)
         if criteria:
             self.set_dst_criteria(node, criteria)
+        else:
+            self.set_dst_criteria(node, self.default_criteria)
         return node
 
-    def set_dst_criteria(self, node, criteria):
-        self.criterias[node.__name__] = criteria
+    def set_src_node(self, node):
+        self.src_nodes.append(node)
 
     def set_dst_node(self, node):
-        self.dst_nodes[node.__name__] = node
+        self.dst_nodes.append(node)
 
-    def set_src_node(self, node):
-        self.src_nodes[node.__name__] = node
+    def set_dst_criteria(self, node, criteria):
+        if criteria not in self.criterias:
+            self.criterias[criteria] = []
+        self.criterias[criteria].append(node)
 
     def add_proc_decorator(self, decorator):
         self.proc_decorators.append(decorator)
@@ -187,35 +209,20 @@ class Node(AbstractNode, NodeLink):
                 if not self.no_input:
                     with self.get_data_lock:
                         data = next(self.get_data_generator)
-                    if isinstance(data, NodeStop):
-                        raise NodeStop()
                     self.executing_data_queue.append(data)
                 result = self._proc_data(data)
                 self._put_data(result)
-            except NodeStop:
-                logger.info(f"Node {self.__name__} No. {task_id} stop")
-                break
             finally:
                 if data in self.executing_data_queue:
                     self.executing_data_queue.remove(data)
-            if task_id == 0 and self._is_upstream_end():
-                logger.info(f"Node {self.__name__} No. {task_id} upstream end")
-                self.end()
-                break
             sleep(0)
-        if all(task.ready() for task in self.tasks if task != gevent.getcurrent()):
-            logger.info(f"Node {self.__name__} No. {task_id} all other tasks finished")
-            self.is_start = False
-            
+
     def _get_data(self):
         while self.is_start:
             data = self.src_queue.get()
             yield from self._get_one_data(data)
-        yield NodeStop()
 
     def _get_one_data(self, data):
-        if isinstance(data, NodeStop):
-            yield NodeStop()
         if self.is_data_iterable:
             assert isinstance(
                 data, Iterable
@@ -231,21 +238,23 @@ class Node(AbstractNode, NodeLink):
         """
         if self.discard_none_output and data is None:
             return
-        for node in self.dst_nodes.values():
-            if not self.criterias.get(node.__name__, None) or self.criterias[
-                node.__name__
-            ](data):
-                if self.put_deepcopy_data:
-                    node.put(copy.deepcopy(data))
-                else:
-                    node.put(data)
+        
+        # Check each criteria and send to its corresponding nodes
+        for criteria_func, dst_nodes in self.criterias.items():
+            if criteria_func(data):
+                for node in dst_nodes:
+                    if isinstance(node, Queue) or not self.criterias:
+                        if self.put_deepcopy_data:
+                            node.put(copy.deepcopy(data))
+                        else:
+                            node.put(data)
 
     def _error_decorator(self, func):
-        @retry(
-            stop=stop_after_attempt(5),
-            wait=wait_exponential_jitter(max=10),
-            retry=retry_if_exception_type(Exception),
-        )
+        # @retry(
+        #     stop=stop_after_attempt(5),
+        #     wait=wait_exponential_jitter(max=10),
+        #     retry=retry_if_exception_type(Exception),
+        # )
         @functools.wraps(func)
         def input_wrapper(data):
             if self.no_input:
@@ -272,9 +281,7 @@ class Node(AbstractNode, NodeLink):
         return error_wrapper
 
     def _is_upstream_end(self):
-        if self.src_nodes and all(
-            node.is_start == False for node in self.src_nodes.values()
-        ):
+        if self.src_nodes and all(node.is_start == False for node in self.src_nodes):
             return True
         else:
             return False

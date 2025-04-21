@@ -1,6 +1,6 @@
 import logging
 
-from .pipeline import Pipeline
+from ..pipeline import Pipeline
 
 logger = logging.getLogger(__name__)
 
